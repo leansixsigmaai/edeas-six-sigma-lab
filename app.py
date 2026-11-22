@@ -8,6 +8,13 @@ from scipy import stats
 from statsmodels.stats.diagnostic import normal_ad
 from sklearn.mixture import GaussianMixture
 from scipy.optimize import brentq
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, Image, PageBreak, KeepTogether
+from reportlab.lib import colors
+from reportlab.lib.styles import getSampleStyleSheet
+from reportlab.lib.enums import TA_CENTER
+from reportlab.lib.units import cm
+from xml.sax.saxutils import escape
+from datetime import datetime
 
 st.set_page_config(page_title="EDEAS Six Sigma AI Lab", layout="wide")
 st.title("EDEAS | Six Sigma AI Lab")
@@ -242,6 +249,161 @@ def fit_models(x, max_components=3, include_mixtures=True):
                 continue
     return models, pd.DataFrame(rows).sort_values('BIC').reset_index(drop=True)
 
+def make_pdf_report(x, all_x, r, variable, fit_table, models, selected_model,
+                    lsl, usl, use_lsl, use_usl, sigma_within, within_method,
+                    sg, selected_charts, strat_series=None):
+    """Create a self-contained, on-demand PDF using the current session inputs."""
+    out = io.BytesIO()
+    doc = SimpleDocTemplate(out, pagesize=(21*cm, 29.7*cm), rightMargin=1.7*cm,
+                            leftMargin=1.7*cm, topMargin=1.6*cm, bottomMargin=1.6*cm)
+    styles = getSampleStyleSheet()
+    styles['Title'].textColor = colors.HexColor('#17577e')
+    story = []
+    def para(t, style='Normal'):
+        story.append(Paragraph(escape(str(t)), styles[style]))
+        story.append(Spacer(1, 0.17*cm))
+    def heading(t):
+        story.append(Spacer(1, .25*cm)); para(t, 'Heading2')
+    def table(rows):
+        rows = [[str(c) for c in row] for row in rows]
+        t = Table([[Paragraph(escape(v), styles['BodyText']) for v in row] for row in rows],
+                  repeatRows=1, hAlign='LEFT', colWidths=[(17.4/len(rows[0]))*cm]*len(rows[0]))
+        t.setStyle(TableStyle([('BACKGROUND',(0,0),(-1,0),colors.HexColor('#e3eef4')),
+            ('GRID',(0,0),(-1,-1),.3,colors.HexColor('#c4d4dc')),
+            ('VALIGN',(0,0),(-1,-1),'TOP'),('BOTTOMPADDING',(0,0),(-1,-1),6),
+            ('TOPPADDING',(0,0),(-1,-1),6)]))
+        story.append(t); story.append(Spacer(1,.25*cm))
+    def addfig(fig):
+        b=io.BytesIO(); fig.savefig(b,format='png',dpi=140,bbox_inches='tight'); plt.close(fig)
+        b.seek(0)
+        from PIL import Image as PILImage
+        im=PILImage.open(b); w,h=im.size; b.seek(0)
+        width=min(17.2*cm, w/140*2.54*cm)
+        height=width*h/w
+        if height>15*cm: height=15*cm; width=height*w/h
+        story.append(Image(b,width=width,height=height)); story.append(Spacer(1,.2*cm))
+    para('EDEAS | Six Sigma AI Lab', 'Title')
+    para('Statistical analysis report - Training Edition', 'Heading2')
+    para(f'Generated: {datetime.now():%Y-%m-%d %H:%M} | Variable: {variable} | Valid observations: {len(x)}')
+    para('Interpret results only after checking measurement quality, sampling, time order and process stability.')
+    heading('1. Exploratory Data Analysis')
+    table([['Statistic','Value'],['N',len(x)],['Mean',f'{r["mean"]:.5g}'],
+           ['StDev overall',f'{r["sd"]:.5g}'],['Median',f'{np.median(x):.5g}'],
+           ['Minimum / Maximum',f'{np.min(x):.5g} / {np.max(x):.5g}'],
+           ['Anderson-Darling normality p-value',f'{r["p"]:.4g}']])
+    para('Normality test: p < 0.05 rejects normality at 5%; p >= 0.05 does not prove normality.')
+    if selected_charts.get('summary'):
+        addfig(summary_figure(x,r,str(variable)))
+    if any(selected_charts.get(k) for k in ('run','hist','box')):
+        fig=selected_eda_charts(x,all_x,str(variable),selected_charts.get('run'),
+                                selected_charts.get('hist'),selected_charts.get('box'))
+        if fig is not None: addfig(fig)
+    if strat_series is not None:
+        plotdf=pd.DataFrame({'value':all_x,'group':strat_series})
+        plotdf=plotdf.loc[np.isfinite(plotdf['value']) & plotdf['group'].notna()]
+        strata=list(plotdf.groupby('group',sort=False))
+        if 2<=len(strata)<=35:
+            fig,ax=plt.subplots(figsize=(max(8,len(strata)*.6),4.5))
+            ax.boxplot([g['value'].to_numpy() for _,g in strata],
+                       tick_labels=[str(k) for k,_ in strata]);ax.tick_params(axis='x',rotation=45)
+            ax.set_title('Stratified box plot');fig.tight_layout();addfig(fig)
+    heading('2. Distribution Fit')
+    para('AIC and BIC compare candidate models on the same dataset. Lower is better; neither is an absolute goodness-of-fit test. BIC penalizes complexity more strongly. No calibrated GOF p-values are implemented.')
+    rows=[['Distribution','AIC','BIC']]
+    for _,row in fit_table.iterrows():
+        rows.append([row['Distribuzione'],f'{row["AIC"]:.2f}',f'{row["BIC"]:.2f}'])
+    table(rows)
+    if selected_model in models:
+        model=models[selected_model]
+        para(f'Selected model: {selected_model}. Parameters: {model["parameters"]}')
+        fig,ax=plt.subplots(figsize=(9,4.5))
+        ax.hist(x,bins='auto',density=True,alpha=.55)
+        grid=np.linspace(np.min(x),np.max(x),600)
+        ax.plot(grid,model['pdf'](grid),linewidth=2)
+        ax.set_title(f'Distribution fit: {selected_model}');fig.tight_layout();addfig(fig)
+    heading('3. Capability Analysis')
+    if not use_lsl and not use_usl:
+        para('No specification limits provided; capability not available.')
+    elif use_lsl and use_usl and lsl>=usl:
+        para('Invalid specification limits (LSL >= USL).')
+    elif selected_model in models:
+        model=models[selected_model]
+        para(f'LSL: {lsl if use_lsl else "not specified"}; USL: {usl if use_usl else "not specified"}.')
+        def fmt(v): return 'N/A' if v is None or not np.isfinite(v) else f'{v:.3f}'
+        if selected_model=='Normal':
+            mean=float(r['mean']); so=float(r['sd'])
+            def idx(sd):
+                sides=[]
+                if use_lsl:sides.append((mean-lsl)/(3*sd))
+                if use_usl:sides.append((usl-mean)/(3*sd))
+                return min(sides) if sides else None
+            sw=sigma_within if np.isfinite(sigma_within) and sigma_within>0 else None
+            table([['Normal capability','Value'],['Cp',fmt((usl-lsl)/(6*sw) if sw and use_lsl and use_usl else None)],
+                   ['Cpk',fmt(idx(sw) if sw else None)],['Pp',fmt((usl-lsl)/(6*so) if use_lsl and use_usl else None)],
+                   ['Ppk',fmt(idx(so))]])
+            para(f'Within estimator: {within_method}. Normal assumption required for classical indices.')
+        else:
+            try:
+                ql=float(model['ppf'](.00135));qm=float(model['ppf'](.5));qu=float(model['ppf'](.99865))
+                pstar=(usl-lsl)/(qu-ql) if use_lsl and use_usl else None
+                sides=[]
+                if use_lsl:sides.append((qm-lsl)/(qm-ql))
+                if use_usl:sides.append((usl-qm)/(qu-qm))
+                table([['Non-normal overall capability','Value'],['Pp*',fmt(pstar)],['Ppk*',fmt(min(sides))],
+                       ['Q0.135%',f'{ql:.5g}'],['Median',f'{qm:.5g}'],['Q99.865%',f'{qu:.5g}']])
+                para('Percentile-based overall indices only. No non-normal within index is inferred from the overall fit.')
+            except (ValueError,RuntimeError,OverflowError) as e:
+                para(f'Non-normal percentiles unavailable: {e}')
+        lower=float(model['cdf'](lsl)) if use_lsl else 0.
+        upper=max(0.,1.-float(model['cdf'](usl))) if use_usl else 0.
+        observed=np.mean(((x<lsl) if use_lsl else np.zeros(len(x),bool)) |
+                         ((x>usl) if use_usl else np.zeros(len(x),bool)))*1e6
+        table([['Defect rate','PPM'],['Observed',f'{observed:.1f}'],['Model expected',f'{(lower+upper)*1e6:.1f}']])
+        fig,ax=plt.subplots(figsize=(9,4.5))
+        ax.hist(x,bins='auto',density=True,alpha=.55)
+        grid=np.linspace(min(np.min(x),lsl if use_lsl else np.min(x)),
+                         max(np.max(x),usl if use_usl else np.max(x)),500)
+        ax.plot(grid,model['pdf'](grid),linewidth=2)
+        if use_lsl:ax.axvline(lsl,linestyle='--',label='LSL')
+        if use_usl:ax.axvline(usl,linestyle='--',label='USL')
+        ax.legend();ax.set_title('Capability - selected model');fig.tight_layout();addfig(fig)
+    heading('4. Stability Analysis')
+    if sg is not None:
+        para('Rational subgroup analysis: subgroup control charts are available in the application. Review all special-cause signals before capability conclusions.')
+        # Include subgroup charts when supported by existing routine.
+        try:
+            labels=list(range(1,len(sg['sizes'])+1))
+            result,err=subgroup_charts(sg,labels,str(variable))
+            if not err and result:
+                fig,n_bad,kind=result
+                para(f'Chart type: Xbar-{kind}; points beyond 3-sigma limits: {n_bad}.')
+                addfig(fig)
+            elif err:para(err)
+        except (ValueError,KeyError,TypeError) as e:para(f'Subgroup chart unavailable: {e}')
+    else:
+        valid=np.isfinite(all_x)
+        pairmask=valid[:-1]&valid[1:]
+        mr=np.abs(np.diff(all_x)[pairmask])
+        if len(mr):
+            mean=float(np.mean(x)); mrbar=float(np.mean(mr)); sigma=mrbar/1.128
+            ni=int(np.sum((x>mean+3*sigma)|(x<mean-3*sigma)))
+            nm=int(np.sum(mr>3.267*mrbar))
+            para(f'I-MR: sigma within = {sigma:.5g}; Individuals outside 3-sigma limits = {ni}; MR outside UCL = {nm}.')
+            fig,(a,b)=plt.subplots(2,1,figsize=(9,6))
+            ix=np.flatnonzero(valid)+1
+            a.plot(ix,x,'o-',markersize=2);a.axhline(mean,color='green')
+            a.axhline(mean+3*sigma,color='red',linestyle='--');a.axhline(mean-3*sigma,color='red',linestyle='--')
+            a.set_title('Individuals chart')
+            b.plot(np.flatnonzero(pairmask)+2,mr,'o-',markersize=2)
+            b.axhline(mrbar,color='green');b.axhline(3.267*mrbar,color='red',linestyle='--')
+            b.set_title('Moving range chart');fig.tight_layout();addfig(fig)
+        else:para('Insufficient consecutive observations for I-MR charts.')
+    heading('Interpretation and limitations')
+    para('The fitted distribution is a modeling assumption. AIC/BIC selection alone cannot validate the tails or prove process stability. Expected PPM is extrapolated from the fitted model. Check rational subgroup formation, data order, independence, measurement system, and representativeness.')
+    doc.build(story)
+    out.seek(0)
+    return out.getvalue()
+
 def selected_eda_charts(x, all_x, variable, show_run, show_hist, show_box):
     selected = int(show_run) + int(show_hist) + int(show_box)
     if not selected: return None
@@ -423,14 +585,23 @@ with fit:
     st.write('Confronto Normal, Lognormal, Weibull, Gamma e miscele gaussiane (GMM).')
     use_gmm = st.checkbox('Includi modelli bimodali e multimodali (Gaussian Mixture)', value=True)
     max_gmm = st.slider('Numero massimo di componenti GMM', 2, 5, 3, disabled=not use_gmm)
-    st.caption('Il BIC penalizza maggiormente la complessità; l’AIC è riportato per confronto. Nessuno dei due dimostra la bontà dell’adattamento.')
+    with st.expander('Come viene scelta la distribuzione? AIC, BIC e goodness-of-fit', expanded=True):
+        st.markdown('**AIC = 2k - 2 log(L)** e **BIC = k log(n) - 2 log(L)**, dove k è il numero di parametri stimati, n il numero di osservazioni e L la verosimiglianza massimizzata.')
+        st.write('Entrambi si minimizzano. AIC privilegia l’accuratezza predittiva relativa; BIC penalizza più fortemente la complessità e aiuta a evitare miscele con troppe componenti.')
+        st.write('**Delta BIC**: differenza rispetto al BIC minimo. Valori piccoli indicano modelli competitivi; differenze elevate favoriscono il modello migliore secondo BIC.')
+        st.warning('**Goodness-of-fit non ancora implementato per ogni distribuzione.** AIC e BIC non sono p-value. Il p-value Anderson–Darling presente nell’EDA testa soltanto la normalità; non va usato per accettare automaticamente Lognormal, Weibull, Gamma o GMM.')
+        st.caption('Per confrontare le code e stimare PPM molto bassi sono necessari controlli diagnostici e, idealmente, test calibrati mediante bootstrap parametrico.')
     if len(x) < 20 and use_gmm:
         st.warning('Per stimare le miscele sono richieste almeno 20 osservazioni; con campioni piccoli la stima è fragile.')
     models, fit_table = fit_models(x, max_gmm, use_gmm)
     if fit_table.empty:
         st.warning('Non è stato possibile stimare un modello.')
     else:
+        fit_table = fit_table.copy()
+        fit_table['Delta AIC'] = fit_table['AIC'] - fit_table['AIC'].min()
+        fit_table['Delta BIC'] = fit_table['BIC'] - fit_table['BIC'].min()
         st.dataframe(fit_table, hide_index=True, use_container_width=True)
+        st.caption('La raccomandazione automatica usa il BIC minimo; la selezione manuale prevale. Un buon punteggio relativo non garantisce un fit adeguato.')
         recommended = str(fit_table.iloc[0]['Distribuzione'])
         selected = st.selectbox('Modello da utilizzare anche nella Capability Overall',
                                 list(models), index=list(models).index(recommended), key='chosen_fit')
@@ -510,9 +681,16 @@ with capability:
         pp = (usl - lsl) / (6 * sigma_overall) if use_lsl and use_usl else None
         cpk = one_sided(sigma_within) if np.isfinite(sigma_within) and sigma_within > 0 else None
         ppk = one_sided(sigma_overall)
-        m1, m2, m3, m4 = st.columns(4)
-        for col, label, val in [(m1, "Cp", cp), (m2, "Cpk", cpk), (m3, "Pp", pp), (m4, "Ppk", ppk)]:
-            col.metric(label, f"{val:.3f}" if val is not None else "N/D")
+        if chosen == 'Normal':
+            m1, m2, m3, m4 = st.columns(4)
+            for col, label, val in [(m1, "Cp", cp), (m2, "Cpk", cpk), (m3, "Pp", pp), (m4, "Ppk", ppk)]:
+                col.metric(label, f"{val:.3f}" if val is not None else "N/D")
+        else:
+            st.info('Modello non normale: Cp/Cpk/Pp/Ppk normali sono nascosti. Mostriamo soltanto la capability Overall basata sui percentili. La Within non normale richiede un metodo specifico.')
+            with st.expander('Confronto didattico: indici sotto ipotesi normale (non usare per questo modello)'):
+                m1, m2, m3, m4 = st.columns(4)
+                for col, label, val in [(m1, "Cp normale", cp), (m2, "Cpk normale", cpk), (m3, "Pp normale", pp), (m4, "Ppk normale", ppk)]:
+                    col.metric(label, f"{val:.3f}" if val is not None else "N/D")
         # Percentile-based non-normal overall indices, based on the selected fitted model.
         try:
             qlo = float(cap_model['ppf'](.00135))
@@ -521,7 +699,7 @@ with capability:
             valid_quantiles = np.isfinite([qlo,qmed,qhi]).all() and qlo < qmed < qhi
         except (ValueError, RuntimeError, OverflowError):
             valid_quantiles = False
-        if valid_quantiles:
+        if valid_quantiles and chosen != 'Normal':
             pp_star = (usl-lsl)/(qhi-qlo) if use_lsl and use_usl else None
             sides = []
             if use_lsl: sides.append((qmed-lsl)/(qmed-qlo))
@@ -531,7 +709,7 @@ with capability:
             a.metric('Pp* — percentili 99,73%', f'{pp_star:.3f}' if pp_star is not None else 'N/D')
             b.metric('Ppk* — percentili / mediana', f'{ppk_star:.3f}')
             st.caption(f'Modello {chosen}: Q0,135% = {qlo:.5g}; Q50% = {qmed:.5g}; Q99,865% = {qhi:.5g}. Indici Overall secondo convenzione percentile-based.')
-        else:
+        elif chosen != 'Normal':
             st.warning('Impossibile calcolare i quantili del modello selezionato.')
         observed = np.mean(((x < lsl) if use_lsl else np.zeros(len(x), dtype=bool)) |
                            ((x > usl) if use_usl else np.zeros(len(x), dtype=bool))) * 1e6
@@ -546,17 +724,18 @@ with capability:
             st.metric(f'PPM attesi — modello {chosen} (Overall)', f'{1e6*(lower_prob+upper_prob):,.1f}')
         except (ValueError, RuntimeError):
             st.warning('PPM del modello selezionato non calcolabili.')
-        m_within, m_overall = st.columns(2)
-        with m_within:
-            st.metric("PPM attesi — Within (normale)",
-                      f"{expected_ppm(sigma_within):,.1f}" if np.isfinite(sigma_within) and sigma_within > 0 else "N/D")
-        with m_overall:
-            st.metric("PPM attesi — Overall (normale)", f"{expected_ppm(sigma_overall):,.1f}")
+        if chosen == 'Normal':
+            m_within, m_overall = st.columns(2)
+            with m_within:
+                st.metric("PPM attesi — Within (normale)",
+                          f"{expected_ppm(sigma_within):,.1f}" if np.isfinite(sigma_within) and sigma_within > 0 else "N/D")
+            with m_overall:
+                st.metric("PPM attesi — Overall (normale)", f"{expected_ppm(sigma_overall):,.1f}")
         fig, ax = plt.subplots(figsize=(10, 4.8))
         ax.hist(x, bins="auto", density=True, color="#8bc7e8", edgecolor="white", alpha=.8)
         grid = np.linspace(min(np.min(x), lsl if use_lsl else np.min(x)), max(np.max(x), usl if use_usl else np.max(x)), 500)
         ax.plot(grid, cap_model["pdf"](grid), color="#b72e34", lw=2, label=f"{chosen} (overall)")
-        if np.isfinite(sigma_within) and sigma_within > 0:
+        if chosen == 'Normal' and np.isfinite(sigma_within) and sigma_within > 0:
             ax.plot(grid, stats.norm.pdf(grid, r["mean"], sigma_within), color="#287ca5", lw=2,
                     linestyle="--", label="Normal (within)")
         if use_lsl: ax.axvline(lsl, color="darkorange", ls="--", label="LSL")
@@ -633,3 +812,38 @@ with stability:
 
 st.divider()
 st.caption("EDEAS Training Edition · Analisi deterministiche Python · Commenti guidati gratuiti (non AI generativa) · I risultati vanno interpretati nel contesto del processo.")
+
+
+st.divider()
+st.subheader('5 · Report PDF completo')
+st.write('Scarica un documento con le quattro sezioni, le tabelle, il modello selezionato, i grafici EDA scelti e la capability coerente con il modello.')
+if 'fit_table' not in locals() or fit_table.empty:
+    st.warning('Prima occorre stimare almeno una distribuzione.')
+else:
+    pdf_model = chosen if 'chosen' in locals() else selected
+    pdf_models = cap_models if 'cap_models' in locals() else models
+    pdf_lsl = lsl if 'lsl' in locals() else float(np.min(x))
+    pdf_usl = usl if 'usl' in locals() else float(np.max(x))
+    pdf_use_lsl = use_lsl if 'use_lsl' in locals() else False
+    pdf_use_usl = use_usl if 'use_usl' in locals() else False
+    pdf_sigma = sigma_within if 'sigma_within' in locals() else float('nan')
+    pdf_method = within_method if 'within_method' in locals() else 'not estimated'
+    pdf_strat = df[strat_col].to_numpy() if 'strat_col' in locals() and strat_col != '—' else None
+    if st.button('Prepara report PDF', type='primary'):
+        with st.spinner('Creazione del report in corso...'):
+            try:
+                st.session_state['pdf_report_bytes'] = make_pdf_report(
+                    x, all_x, r, str(variable), fit_table, pdf_models, pdf_model,
+                    pdf_lsl, pdf_usl, pdf_use_lsl, pdf_use_usl, pdf_sigma, pdf_method,
+                    sg, {'summary':show_summary,'run':show_run,'hist':show_hist,'box':show_box},pdf_strat)
+                st.session_state['pdf_report_signature'] = (str(variable),len(x),float(np.mean(x)),float(np.std(x)),pdf_model,pdf_lsl,pdf_usl,pdf_use_lsl,pdf_use_usl,
+                    show_summary,show_run,show_hist,show_box,strat_col if 'strat_col' in locals() else None)
+            except Exception as exc:
+                st.error(f'Impossibile creare il PDF: {exc}')
+    signature = (str(variable),len(x),float(np.mean(x)),float(np.std(x)),pdf_model,pdf_lsl,pdf_usl,pdf_use_lsl,pdf_use_usl,
+                 show_summary,show_run,show_hist,show_box,strat_col if 'strat_col' in locals() else None)
+    if st.session_state.get('pdf_report_signature') == signature and st.session_state.get('pdf_report_bytes'):
+        st.download_button('Scarica report PDF',data=st.session_state['pdf_report_bytes'],
+            file_name=f'EDEAS_{safe_name}_Full_Analysis.pdf',mime='application/pdf')
+    else:
+        st.caption('Premi Prepara report PDF dopo aver completato le scelte. Se cambi le impostazioni, rigenera il report.')
